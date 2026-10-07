@@ -7,13 +7,29 @@ import { useTranslation } from "react-i18next";
 import { NavLink, Route, Routes } from "react-router-dom";
 import { useSaveEvidenceMutation, useGetEvidenceQuery } from "./store/api";
 import { useAppDispatch, useAppSelector } from "./store/hooks";
-import { addObjection, completeEvidence, initialize, reorder, resolveObjection, restore, selectEvidence, setMode, setOnline, setPhase, showEvidence, snapshot, tick, toggleSensitive } from "./store/courtSlice";
-import type { Evidence, Party, SessionPhase } from "./types";
+import { addObjection, completeEvidence, initialize, markSealBroken, reconcileEvidence, registerHandover, reorder, resolveObjection, restore, selectEvidence, setMode, setOnline, setPhase, setRole, showEvidence, snapshot, tick, toggleSensitive, updateReceipt } from "./store/courtSlice";
+import type { Evidence, Party, ReleaseRecord, Role, SessionPhase } from "./types";
 
 const objectionSchema = z.object({ ground: z.string().min(2), explanation: z.string().min(6) });
 type ObjectionForm = z.infer<typeof objectionSchema>;
 
+const handoverSchema = z.object({
+  type: z.enum(["入库", "外借", "归还", "换袋"]),
+  custodian: z.string().min(1, "请填写保管人"),
+  sealNo: z.string().min(1, "请填写封条编号"),
+  location: z.string().min(1, "请填写存放位置"),
+  sealStatus: z.enum(["完好", "破损"]),
+  receiptStatus: z.enum(["有回执", "无回执"]),
+  sealNote: z.string()
+});
+type HandoverForm = z.infer<typeof handoverSchema>;
+
 function formatTime(seconds: number) { return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`; }
+
+/** 取某证据最近一条放行记录（releases 按最新在前存储） */
+function latestRelease(releases: ReleaseRecord[], evidenceId: string): ReleaseRecord | undefined { return releases.find((r) => r.evidenceId === evidenceId); }
+
+const releaseColor: Record<ReleaseRecord["status"], string> = { 放行: "green", 拦下: "red", 退回待复核: "orange", 失效: "gray" };
 
 function CourtControl() {
   const dispatch = useAppDispatch();
@@ -23,20 +39,27 @@ function CourtControl() {
   const current = state.evidence.find((item) => item.id === state.session.currentEvidenceId);
   const pending = state.objections.filter((item) => item.status === "待裁定");
   const { control, handleSubmit, reset } = useForm<ObjectionForm>({ resolver: zodResolver(objectionSchema), defaultValues: { ground: "关联性异议", explanation: "" } });
+  const isAgent = state.role === "代理人";
 
   useEffect(() => { const timer = window.setInterval(() => dispatch(tick()), 1000); return () => window.clearInterval(timer); }, [dispatch]);
   const submitObjection = (values: ObjectionForm) => { if (!current) return; dispatch(addObjection({ evidenceId: current.id, ...values })); reset(); setObjectionOpen(false); Message.warning("异议已进入待裁定分支"); };
+  const handleShow = () => { if (!current) return; const rel = latestRelease(state.releases, current.id); if (rel && rel.status === "拦下") { Message.warning(isAgent ? "已拦下" : `已拦下：${rel.reasons.join("、")}`); } dispatch(showEvidence()); };
 
   return <div className="court-grid">
     <Card className="operator" title="证据操作台" extra={<Space><Tag color={state.online ? "green" : "red"}>{state.online ? "本地审计在线" : "离线恢复模式"}</Tag><Button size="small" onClick={() => dispatch(snapshot("手动存档"))}>保存快照</Button></Space>}>
-      <div className="evidence-list">{state.evidence.map((item, index) => <article key={item.id} draggable onDragStart={(event) => event.dataTransfer.setData("text/plain", String(index))} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { const from = Number(event.dataTransfer.getData("text/plain")); const items = [...state.evidence]; const [moved] = items.splice(from, 1); items.splice(index, 0, moved); dispatch(reorder(items)); }} className={current?.id === item.id ? "active" : ""}>
-        <span>{index + 1}</span><div><b>{item.exhibitNo} · {item.title}</b><small>{item.type} · {item.presenter} · {item.duration}分钟</small></div><Tag color={item.status === "已展示" ? "green" : item.status === "展示中" ? "orange" : "gray"}>{item.status}</Tag><Button size="mini" onClick={() => dispatch(selectEvidence(item.id))}>选中</Button>
-      </article>)}</div>
-      <div className="control-strip"><Button type="primary" onClick={() => dispatch(showEvidence())} disabled={!current}>开始展示</Button><Button onClick={() => dispatch(completeEvidence())} disabled={!current}>完成并切换下一条</Button><Button status="warning" onClick={() => setObjectionOpen(true)} disabled={!current}>提出异议</Button><Button onClick={() => dispatch(toggleSensitive(current?.id ?? ""))} disabled={!current}>{current?.sensitive ? "恢复敏感内容" : "隐藏敏感内容"}</Button></div>
+      <div className="evidence-list">{state.evidence.map((item, index) => {
+        const rel = latestRelease(state.releases, item.id);
+        return <article key={item.id} draggable onDragStart={(event) => event.dataTransfer.setData("text/plain", String(index))} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { const from = Number(event.dataTransfer.getData("text/plain")); const items = [...state.evidence]; const [moved] = items.splice(from, 1); items.splice(index, 0, moved); dispatch(reorder(items)); }} className={current?.id === item.id ? "active" : ""}>
+          <span>{index + 1}</span><div><b>{item.exhibitNo} · {item.title}</b><small>{item.type} · {item.presenter} · {item.duration}分钟</small></div>
+          <Space size={4}>{rel && <Tag color={releaseColor[rel.status]}>{rel.status}</Tag>}<Tag color={item.status === "已展示" ? "green" : item.status === "展示中" ? "orange" : item.status === "退回待复核" ? "orange" : "gray"}>{item.status}</Tag></Space>
+          <Button size="mini" onClick={() => dispatch(selectEvidence(item.id))}>选中</Button>
+        </article>;
+      })}</div>
+      <div className="control-strip"><Button type="primary" onClick={handleShow} disabled={!current}>开始展示</Button><Button onClick={() => dispatch(completeEvidence())} disabled={!current}>完成并切换下一条</Button><Button status="warning" onClick={() => setObjectionOpen(true)} disabled={!current}>提出异议</Button><Button onClick={() => dispatch(toggleSensitive(current?.id ?? ""))} disabled={!current}>{current?.sensitive ? "恢复敏感内容" : "隐藏敏感内容"}</Button></div>
     </Card>
     <div className="side-stack">
       <Card title="公开屏预览" extra={<Select size="small" value={mode} onChange={(value) => { setLocalMode(value as "控制" | "预览"); dispatch(setMode(value === "预览" ? "公开屏预览" : "庭审控制")); }} options={[{value:"控制",label:"控制者视图"},{value:"预览",label:"公开屏"}]} />} className="preview-card">
-        <div className="public-screen">{mode === "预览" ? <><small>公开展示</small><h2>{current?.exhibitNo ?? "暂无证据"}</h2><h3>{current?.title ?? "庭审进行中"}</h3>{current?.sensitive ? <div className="redaction"><b>敏感内容已遮罩</b><p>该证据包含不适宜公开的信息，庭审结束后统一入卷。</p></div> : <p>{current?.note}</p>}<footer>计时 {formatTime(state.session.timerSeconds)} · {state.session.phase}</footer></> : <><small>控制者私有视图</small><h2>敏感内容可预览</h2><p>{current?.sensitive ? "此证据将在公开屏遮罩客户名称，控制者可查看完整备注。" : "当前证据可完整公开。"}</p><Tag color="red">操作端专属</Tag></>}</div>
+        <div className="public-screen">{mode === "预览" ? <><small>公开展示</small><h2>{current?.exhibitNo ?? "暂无证据"}</h2><h3>{current?.title ?? "庭审进行中"}</h3>{current?.status === "退回待复核" && <Tag color="orange" style={{ marginBottom: 12 }}>退回待复核</Tag>}{current?.sensitive ? <div className="redaction"><b>敏感内容已遮罩</b><p>该证据包含不适宜公开的信息，庭审结束后统一入卷。</p></div> : <p>{current?.note}</p>}<footer>计时 {formatTime(state.session.timerSeconds)} · {state.session.phase}</footer></> : <><small>控制者私有视图</small><h2>敏感内容可预览</h2><p>{current?.sensitive ? "此证据将在公开屏遮罩客户名称，控制者可查看完整备注。" : "当前证据可完整公开。"}</p><Tag color="red">操作端专属</Tag></>}</div>
       </Card>
       <Card title="待审异议" extra={<Tag color="red">{pending.length}</Tag>}>{pending.map((item) => <div className="objection" key={item.id}><b>{item.ground}</b><p>{item.explanation}</p><Space><Button size="mini" status="success" onClick={() => dispatch(resolveObjection({ id: item.id, status: "支持" }))}>支持并跳过</Button><Button size="mini" onClick={() => dispatch(resolveObjection({ id: item.id, status: "驳回" }))}>驳回继续</Button></Space></div>)}{!pending.length && <p>当前没有待裁定异议。</p>}</Card>
     </div>
@@ -57,6 +80,48 @@ function EvidencePage() {
   return <Card title="证据目录与公开属性"><div className="catalog">{state.evidence.map((item) => <article key={item.id}><div><b>{item.exhibitNo} {item.title}</b><p>{item.note}</p></div><Tag>{item.type}</Tag><div className="switch-line"><span>公开屏敏感遮罩</span><Switch checked={item.sensitive} onChange={() => dispatch(toggleSensitive(item.id))} /></div></article>)}</div></Card>;
 }
 
+function CustodyLedgerPage() {
+  const state = useAppSelector((root) => root.court);
+  const dispatch = useAppDispatch();
+  const [handoverFor, setHandoverFor] = useState<string | null>(null);
+  const { control, handleSubmit, reset } = useForm<HandoverForm>({ resolver: zodResolver(handoverSchema), defaultValues: { type: "外借", custodian: "", sealNo: "", location: "", sealStatus: "完好", receiptStatus: "无回执", sealNote: "" } });
+  const openHandover = (evidenceId: string) => {
+    const custody = state.custody.find((c) => c.evidenceId === evidenceId);
+    reset({ type: "外借", custodian: "", sealNo: custody?.sealNo ?? "", location: custody?.location ?? "", sealStatus: custody?.sealStatus ?? "完好", receiptStatus: "无回执", sealNote: "" });
+    setHandoverFor(evidenceId);
+  };
+  const submitHandover = (values: HandoverForm) => {
+    if (!handoverFor) return;
+    dispatch(registerHandover({ evidenceId: handoverFor, ...values }));
+    setHandoverFor(null);
+    Message.success("交接已登记并重新核对");
+  };
+
+  return <Card title="卷宗保管台账" extra={<Tag>仅书记员 / 审判庭可见</Tag>}>
+    <div className="ledger">{state.evidence.map((item) => {
+      const custody = state.custody.find((c) => c.evidenceId === item.id);
+      const rel = latestRelease(state.releases, item.id);
+      if (!custody) return null;
+      return <article key={item.id} className="ledger-card">
+        <header><b>{item.exhibitNo} · {item.title}</b>{rel && <Tag color={releaseColor[rel.status]}>{rel.status}</Tag>}</header>
+        <div className="ledger-grid"><span>封条编号</span><code>{custody.sealNo}</code><span>存放位置</span><code>{custody.location}</code><span>封条状态</span><Tag color={custody.sealStatus === "完好" ? "green" : "red"}>{custody.sealStatus}</Tag></div>
+        {rel && rel.reasons.length > 0 && <p className="ledger-reasons">拦下原因：{rel.reasons.join("、")}（批次 {rel.batchNo}）</p>}
+        <div className="ledger-handovers"><b>最近交接记录</b><Timeline>{custody.handovers.slice().reverse().map((h) => <Timeline.Item key={h.id} label={new Date(h.time).toLocaleString("zh-CN", { hour12: false })}><Space wrap><Tag>{h.type}</Tag><small>{h.custodian}</small><small>{h.sealNo} / {h.location}</small><Tag color={h.sealStatus === "完好" ? "green" : "red"}>{h.sealStatus}</Tag><Tag color={h.receiptStatus === "有回执" ? "green" : "orange"}>{h.receiptStatus}</Tag>{h.sealNote && <small className="seal-note">{h.sealNote}</small>}{h.receiptStatus === "无回执" && <Button size="mini" onClick={() => dispatch(updateReceipt(h.id))}>更新回执</Button>}</Space></Timeline.Item>)}</Timeline></div>
+        <Space><Button size="mini" type="primary" onClick={() => openHandover(item.id)}>登记交接</Button><Button size="mini" status="warning" onClick={() => dispatch(markSealBroken(item.id))}>标记封条破损</Button><Button size="mini" onClick={() => dispatch(reconcileEvidence(item.id))}>重新核对</Button></Space>
+      </article>;
+    })}</div>
+    <Modal title="登记交接" visible={!!handoverFor} onCancel={() => setHandoverFor(null)} onOk={() => handleSubmit(submitHandover)()}><Form layout="vertical">
+      <Form.Item label="交接类型"><Controller name="type" control={control} render={({ field }) => <Select {...field} options={["入库", "外借", "归还", "换袋"].map((t) => ({ value: t, label: t }))} />} /></Form.Item>
+      <Form.Item label="保管人"><Controller name="custodian" control={control} render={({ field }) => <Input {...field} placeholder="保管人姓名" />} /></Form.Item>
+      <Form.Item label="封条编号"><Controller name="sealNo" control={control} render={({ field }) => <Input {...field} />} /></Form.Item>
+      <Form.Item label="存放位置"><Controller name="location" control={control} render={({ field }) => <Input {...field} />} /></Form.Item>
+      <Form.Item label="封条状态"><Controller name="sealStatus" control={control} render={({ field }) => <Select {...field} options={["完好", "破损"].map((t) => ({ value: t, label: t }))} />} /></Form.Item>
+      <Form.Item label="回执状态"><Controller name="receiptStatus" control={control} render={({ field }) => <Select {...field} options={["有回执", "无回执"].map((t) => ({ value: t, label: t }))} />} /></Form.Item>
+      <Form.Item label="封条说明"><Controller name="sealNote" control={control} render={({ field }) => <Input.TextArea {...field} placeholder="封条情况说明（敏感，不进公开屏）" />} /></Form.Item>
+    </Form></Modal>
+  </Card>;
+}
+
 export default function App() {
   const dispatch = useAppDispatch();
   const state = useAppSelector((root) => root.court);
@@ -66,5 +131,6 @@ export default function App() {
   useEffect(() => { if (data.length) dispatch(initialize(data)); }, [data, dispatch]);
   useEffect(() => { const timer = window.setTimeout(() => void save(state.evidence), 300); return () => window.clearTimeout(timer); }, [state.evidence, save]);
   const metrics = useMemo(() => ({ shown: state.evidence.filter((item) => item.status === "已展示").length, sensitive: state.evidence.filter((item) => item.sensitive).length, objections: state.objections.length }), [state]);
-  return <div className="shell"><aside><div className="brand"><b>COURT</b><span>庭审控制</span></div><nav><NavLink to="/">{t("control")}</NavLink><NavLink to="/evidence">证据目录</NavLink><NavLink to="/timeline">{t("timeline")}</NavLink></nav><Button onClick={() => void i18n.changeLanguage(i18n.language === "zh" ? "en" : "zh")}>{i18n.language === "zh" ? "EN" : "中文"}</Button></aside><main><header><div><small>案件号 2026-民初-1084 · 全流程审计开启</small><h1>{t("title")}</h1></div><div className="top-tools"><label>本地恢复 <Switch checked={!state.online} onChange={(value) => dispatch(setOnline(!value))} /></label><Tag color={state.online ? "green" : "orange"}>{state.online ? "协作同步" : "离线操作"}</Tag></div></header><section className="metrics"><Card><Statistic title="证据总数" value={state.evidence.length} /></Card><Card><Statistic title="已完成质证" value={metrics.shown} /></Card><Card><Statistic title="敏感证据" value={metrics.sensitive} /></Card><Card><Statistic title="异议记录" value={metrics.objections} /></Card></section><Routes><Route path="/" element={<CourtControl />} /><Route path="/evidence" element={<EvidencePage />} /><Route path="/timeline" element={<TimelinePage />} /></Routes></main></div>;
+  const canViewLedger = state.role === "书记员" || state.role === "审判庭";
+  return <div className="shell"><aside><div className="brand"><b>COURT</b><span>庭审控制</span></div><nav><NavLink to="/">{t("control")}</NavLink><NavLink to="/evidence">证据目录</NavLink>{canViewLedger && <NavLink to="/ledger">保管台账</NavLink>}<NavLink to="/timeline">{t("timeline")}</NavLink></nav><Button onClick={() => void i18n.changeLanguage(i18n.language === "zh" ? "en" : "zh")}>{i18n.language === "zh" ? "EN" : "中文"}</Button></aside><main><header><div><small>案件号 2026-民初-1084 · 全流程审计开启</small><h1>{t("title")}</h1></div><div className="top-tools"><label>角色<Select size="small" value={state.role} onChange={(value) => dispatch(setRole(value as Role))} style={{ width: 110 }} options={[{value:"书记员",label:"书记员"},{value:"审判庭",label:"审判庭"},{value:"代理人",label:"代理人"}]} /></label><label>本地恢复 <Switch checked={!state.online} onChange={(value) => dispatch(setOnline(!value))} /></label><Tag color={state.online ? "green" : "orange"}>{state.online ? "协作同步" : "离线操作"}</Tag></div></header><section className="metrics"><Card><Statistic title="证据总数" value={state.evidence.length} /></Card><Card><Statistic title="已完成质证" value={metrics.shown} /></Card><Card><Statistic title="敏感证据" value={metrics.sensitive} /></Card><Card><Statistic title="异议记录" value={metrics.objections} /></Card></section><Routes><Route path="/" element={<CourtControl />} /><Route path="/evidence" element={<EvidencePage />} />{canViewLedger && <Route path="/ledger" element={<CustodyLedgerPage />} />}<Route path="/timeline" element={<TimelinePage />} /></Routes></main></div>;
 }
